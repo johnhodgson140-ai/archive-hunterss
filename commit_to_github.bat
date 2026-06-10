@@ -2,7 +2,7 @@
 setlocal enabledelayedexpansion
 
 echo ========================================
-echo  Archive Hunter GitHub Commit Helper
+echo  archive-hunterss Git Commit Helper
 echo ========================================
 
 git --version > nul 2>&1
@@ -25,8 +25,8 @@ echo Adding files to git staging area...
 git add .
 
 echo.
-set /p COMMIT_MSG=Enter commit message [Initial Archive Hunter commit]:
-if "%COMMIT_MSG%"=="" set COMMIT_MSG=Initial Archive Hunter commit
+set /p COMMIT_MSG=Enter commit message [Initial archive-hunterss commit]:
+if "%COMMIT_MSG%"=="" set COMMIT_MSG=Initial archive-hunterss commit
 
 git commit -m "%COMMIT_MSG%"
 if %errorlevel% neq 0 (
@@ -39,6 +39,7 @@ echo.
 set /p REMOTE_URL=Enter GitHub remote URL to add (leave blank to skip):
 if not "%REMOTE_URL%"=="" (
     git remote add origin %REMOTE_URL%
+    git branch -M main
     git push -u origin main
 )
 
