@@ -1,0 +1,13 @@
+.venv/
+.venv - Copy/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+memory_store.json
+.DS_Store
+node_modules/
+coverage/
+.vscode/
+.github - Copy/

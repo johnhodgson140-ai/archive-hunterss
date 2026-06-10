@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Archive Hunter</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="hero">
+    <div class="hero-content">
+      <h1>Archive Hunter</h1>
+      <p>The ultimate archive fashion deal finder. Scan rare YSL, Dior Homme, Hedi Slimane, Japanese auctions, Mercari JP, Xianyu, eBay auctions and more.</p>
+      <div class="buttons">
+        <a href="https://github.com/your-username/archive-hunter" target="_blank">View on GitHub</a>
+        <a href="#setup">Get Started</a>
+      </div>
+    </div>
+  </header>
+
+  <section class="section" id="features">
+    <h2>What this repo includes</h2>
+    <ul>
+      <li>Telegram bot for archive fashion search and auction monitoring</li>
+      <li>Persistent memory/training notes for rare designers and auction targets</li>
+      <li>Local fallback storage so the bot works without Supabase</li>
+      <li>24/7 hunt alerts and marketplace intelligence commands</li>
+      <li>GitHub Pages website powered by this repo</li>
+    </ul>
+  </section>
+
+  <section class="section" id="how-it-works">
+    <h2>How it works</h2>
+    <p>The bot uses Claude AI to interpret archive fashion search queries and generate actionable hunting advice. It stores user profiles, hunts, and watched listings locally, with optional Supabase support for cloud persistence.</p>
+  </section>
+
+  <section class="section" id="setup">
+    <h2>Set up your own Archive Hunter</h2>
+    <ol>
+      <li>Clone the repository to your PC.</li>
+      <li>Run <code>.\setup.bat</code> in <code>c:\archive-hunter</code>.</li>
+      <li>Open <code>.env</code> and fill in:<br>
+        <code>TELEGRAM_BOT_TOKEN</code><br>
+        <code>ANTHROPIC_API_KEY</code>
+      </li>
+      <li>Leave <code>SUPABASE_URL</code> and <code>SUPABASE_KEY</code> empty if you do not want cloud persistence.</li>
+      <li>Start the bot with <code>.\.venv\Scripts\activate.bat</code> and <code>python bot.py</code>.</li>
+    </ol>
+    <p>Then message your bot on Telegram and use commands like <code>/start</code>, <code>/help</code>, <code>/scan</code>, and <code>/hunt</code>.</p>
+  </section>
+
+  <section class="section" id="pages">
+    <h2>GitHub Pages website</h2>
+    <p>This site is generated from the <code>docs/</code> folder in the repository. After pushing to <code>main</code>, GitHub Actions will deploy the site automatically.</p>
+    <p>To enable the site, go to <strong>Settings &gt; Pages</strong> in your GitHub repository and choose the <code>main</code> branch with the <code>/docs</code> folder.</p>
+  </section>
+
+  <footer>
+    <p>Archive Hunter • Telegram bot + GitHub Pages site</p>
+  </footer>
+</body>
+</html>
