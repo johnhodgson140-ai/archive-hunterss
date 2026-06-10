@@ -6,6 +6,9 @@ __pycache__/
 *.pyd
 .env
 memory_store.json
+intel_store.json
+db_store.json
+bot.pid
 .DS_Store
 node_modules/
 coverage/

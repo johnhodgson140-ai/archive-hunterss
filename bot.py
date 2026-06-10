@@ -5,6 +5,26 @@ Bulletproof version — uses direct REST calls to Supabase, no library issues.
 
 import os
 import json
+
+# ─── Load local .env file FIRST ───
+def load_env_file(path=".env"):
+    if not os.path.isfile(path):
+        print(f"WARNING: {path} not found")
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and value:
+                os.environ[key] = value
+                print(f"LOADED: {key}={value[:30]}...")
+
+load_env_file()
+
 import asyncio
 import logging
 import re
@@ -16,27 +36,9 @@ from telegram.ext import (
     MessageHandler, ContextTypes, filters
 )
 import anthropic
-
-# ─── Load local .env file if present ───
-
-def load_env_file(path=".env"):
-    if not os.path.isfile(path):
-        return
-    with open(path, "r", encoding="utf-8") as f:
-        for raw in f:
-            line = raw.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            key = key.strip()
-            value = value.strip().strip('"').strip("'")
-            existing = os.environ.get(key, "")
-            if not key:
-                continue
-            if not existing or existing.startswith("paste_") or existing == "" or existing == "None":
-                os.environ[key] = value
-
-load_env_file()
+import marketplaces
+import vision
+import psutil
 
 # ─── Config ───
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -44,21 +46,48 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
 CLAUDE_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
 
-if not BOT_TOKEN:
-    raise SystemExit("Missing TELEGRAM_BOT_TOKEN in environment or .env")
-if not CLAUDE_API_KEY:
-    raise SystemExit("Missing ANTHROPIC_API_KEY in environment or .env")
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("ArchiveHunter")
 
-# Debug: log which env vars are set
-log.info(f"TELEGRAM_BOT_TOKEN: {'SET (' + BOT_TOKEN[:8] + '...)' if BOT_TOKEN else 'EMPTY'}")
-log.info(f"SUPABASE_URL: {'SET (' + SUPABASE_URL[:20] + '...)' if SUPABASE_URL else 'EMPTY'}")
-log.info(f"SUPABASE_KEY: {'SET (' + SUPABASE_KEY[:8] + '...)' if SUPABASE_KEY else 'EMPTY'}")
-log.info(f"ANTHROPIC_API_KEY: {'SET (' + CLAUDE_API_KEY[:8] + '...)' if CLAUDE_API_KEY else 'EMPTY'}")
+log.info(f"TELEGRAM_BOT_TOKEN loaded: {BOT_TOKEN[:20]}...")
+log.info(f"ANTHROPIC_API_KEY loaded: {CLAUDE_API_KEY[:20]}...")
 
-claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+if not BOT_TOKEN:
+    raise SystemExit("Missing TELEGRAM_BOT_TOKEN in environment or .env")
+if not CLAUDE_API_KEY:
+    # Don't exit when Claude key is missing; run the bot with AI disabled
+    log.warning("ANTHROPIC_API_KEY not set — AI features will be disabled until provided in .env or environment.")
+
+claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY) if CLAUDE_API_KEY else None
+
+# Small health check to mark whether Claude is reachable
+CLAUDE_OK = False
+def test_claude():
+    global CLAUDE_OK
+    if not claude_client:
+        CLAUDE_OK = False
+        log.warning("Claude client not configured (ANTHROPIC_API_KEY missing)")
+        return CLAUDE_OK
+    try:
+        # lightweight call to check API key validity
+        claude_client.ping = getattr(claude_client, 'ping', None)
+        # If the client has a simple method, try a harmless call; otherwise do a short message
+        try:
+            _ = claude_client.messages.create(model="claude-sonnet-4-6", messages=[{"role":"user","content":"ping"}], max_tokens=5)
+            CLAUDE_OK = True
+        except Exception:
+            # fallback to marking unavailable but don't crash
+            CLAUDE_OK = False
+        if not CLAUDE_OK:
+            log.warning("Claude health check failed — AI calls may be unavailable")
+        else:
+            log.info("Claude health check OK")
+    except Exception as e:
+        CLAUDE_OK = False
+        log.error(f"Claude health check error: {e}")
+    return CLAUDE_OK
+
+test_claude()
 
 # ─── Supabase via REST (no library needed) ───
 
@@ -199,6 +228,7 @@ def supa_update(table, data, match_col, match_val):
 # ─── Archive memory and training helpers ───
 
 MEMORY_FILE = os.path.join(os.path.dirname(__file__), "memory_store.json")
+INTEL_FILE = os.path.join(os.path.dirname(__file__), "intel_store.json")
 ARCHIVE_TRAINING_FOCUS = [
     "Hedi Slimane era Dior Homme tailoring, skinny denim, and leather pieces",
     "Yves Saint Laurent / Saint Laurent archive boots, jackets, and runway pieces",
@@ -276,10 +306,83 @@ def build_training_context(tid):
     focus_text = "Archive training focus: " + "; ".join(ARCHIVE_TRAINING_FOCUS) + ".\n\n"
     return focus_text + memory_text
 
+# ─── Intel storage (piece price intelligence) ───
+
+def load_intel_store():
+    if not os.path.isfile(INTEL_FILE):
+        return {}
+    try:
+        with open(INTEL_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log.error(f"Load intel store failed: {e}")
+        return {}
+
+
+def save_intel_store(store):
+    try:
+        with open(INTEL_FILE, "w", encoding="utf-8") as f:
+            json.dump(store, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.error(f"Save intel store failed: {e}")
+
+
+def get_all_intel():
+    return load_intel_store()
+
+
+def add_intel(designer, piece, price_range, platforms, notes=""):
+    store = load_intel_store()
+    key = f"{designer.lower()}|{piece.lower()}"
+    store[key] = {
+        "designer": designer,
+        "piece": piece,
+        "price_range": price_range,
+        "platforms": platforms,
+        "notes": notes,
+        "added_at": str(asyncio.get_event_loop().time())
+    }
+    save_intel_store(store)
+    return store[key]
+
+
+def find_intel(query):
+    """Find matching intel by designer or piece name"""
+    store = load_intel_store()
+    query_lower = query.lower()
+    matches = []
+    for key, intel in store.items():
+        if query_lower in intel["designer"].lower() or query_lower in intel["piece"].lower():
+            matches.append(intel)
+    return matches
+
+# ─── Auction link generators ───
+
+def generate_search_links(query):
+    """Generate direct search links for all major platforms"""
+    import urllib.parse
+    encoded = urllib.parse.quote(query.strip())
+    
+    links = {
+        "mercari_jp": f"https://jp.mercari.com/search?keyword={encoded}",
+        "yahoo_auctions": f"https://auctions.yahoo.co.jp/search/search?p={encoded}&auccat=",
+        "xianyu": f"https://m.58.com/xiaoyuanzhe/?search_param={encoded}",
+        "ebay": f"https://www.ebay.com/sch/i.html?_nkw={encoded}",
+        "grailed": f"https://www.grailed.com/listings/search?search_query={encoded}",
+        "vinted": f"https://www.vinted.com/catalog?search_text={encoded}",
+    }
+    return links
+
 # ─── Claude AI ───
 
 def ask_claude(prompt, system=""):
-    models = ["claude-sonnet-4-6", "claude-3-5-sonnet-20241022", "claude-3-haiku-20240307"]
+    import time
+    if not CLAUDE_OK:
+        log.warning("ask_claude called but CLAUDE_OK is False")
+        return "AI unavailable — Anthropic/Claude not configured or currently unreachable. Try again later."
+
+    models = ["claude-sonnet-4-6", "claude-haiku-4-5-20251001"]
+    last_exc = None
     for model in models:
         try:
             log.info(f"Calling Claude ({model})...")
@@ -292,23 +395,34 @@ def ask_claude(prompt, system=""):
             log.info(f"Claude OK ({model})")
             return msg.content[0].text
         except Exception as e:
-            log.error(f"Claude error ({model}): {type(e).__name__}: {e}")
+            last_exc = e
+            log.warning(f"Claude error ({model}): {type(e).__name__}: {e}")
+            time.sleep(0.5)
             continue
-    return "AI unavailable — check your ANTHROPIC_API_KEY and credits at console.anthropic.com"
+    log.error(f"All Claude models failed: {last_exc}")
+    return "AI unavailable — remote API error or quota exceeded. Check ANTHROPIC_API_KEY and network connectivity."
 
 async def safe_reply(update, text):
-    try:
-        if len(text) > 4000:
-            text = text[:4000] + "..."
-        await update.message.reply_text(text, parse_mode="Markdown")
-    except Exception:
+    from telegram.error import RetryAfter, BadRequest
+    if len(text) > 4000:
+        text = text[:4000] + "..."
+    for attempt in range(4):
         try:
-            await update.message.reply_text(text)
-        except Exception:
+            await update.message.reply_text(text, parse_mode="Markdown")
+            return
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except BadRequest:
+            # Markdown parse error — retry as plain text
             try:
-                await update.message.reply_text("Something went wrong displaying the response. Try again.")
+                await update.message.reply_text(text)
+            except RetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
             except Exception:
                 pass
+            return
+        except Exception:
+            return
 
 # ─── Database helpers ───
 
@@ -396,6 +510,75 @@ def parse_size(text):
         if s in text:
             return s
     return ""
+
+
+def parse_sizes(text):
+    """Return a list of parsed size tokens from a freeform text."""
+    t = text.upper()
+    sizes = []
+
+    # explicit prefixed sizes: EU44, UK10, US9, JP28, IT46
+    for m in re.finditer(r'\b(EU|UK|US|JP|IT|FR)\s*([0-9]{1,2}(?:\.[0-9]+)?)\b', t):
+        pref, num = m.groups()
+        sizes.append(f"{pref}{num.rstrip('.0')}")
+
+    # ranges like 44-46 or 44/46
+    for m in re.finditer(r'\b([0-9]{1,2})\s*[\-/]\s*([0-9]{1,2})\b', t):
+        a, b = int(m.group(1)), int(m.group(2))
+        if a <= b and b - a <= 10:
+            for v in range(a, b + 1):
+                sizes.append(str(v))
+
+    # standalone numbers near 'size' or shoe words
+    for m in re.finditer(r'\bSIZE\s*[:\-]?\s*([0-9]{1,2}(?:\.[0-9]+)?)', t):
+        sizes.append(m.group(1).rstrip('.0'))
+
+    for m in re.finditer(r'\b([0-9]{1,2}(?:\.[0-9]+)?)\b', t):
+        num = m.group(1)
+        # avoid year-like numbers (e.g., 2001) by restricting to <= 60
+        try:
+            if 3 <= int(float(num)) <= 60:
+                sizes.append(num.rstrip('.0'))
+        except Exception:
+            pass
+
+    # alpha sizes
+    for s in ["XXXL", "XXL", "XL", "XS", "S", "M", "L"]:
+        if s in t and s not in sizes:
+            sizes.append(s)
+
+    # map through parse_size to format known prefixes
+    out = []
+    for s in sizes:
+        parsed = parse_size(s)
+        out.append(parsed if parsed else s)
+
+    # unique and preserve order
+    seen = set()
+    ordered = []
+    for x in out:
+        if not x:
+            continue
+        if x not in seen:
+            seen.add(x)
+            ordered.append(x)
+    return ordered
+
+
+def normalize_search_query(text):
+    """Clean user query to a concise marketplace search query (brand + piece)."""
+    t = text
+    # remove common platform words
+    t = re.sub(r"\b(mercari|mercari.jp|vinted|yahoo|ebay|xianyu|grailed|weidian|taobao|auction|auctions)\b", " ", t, flags=re.I)
+    # remove price filters
+    t = re.sub(r"under\s*[£€$¥]?\s*\d+", " ", t, flags=re.I)
+    # remove explicit size mentions
+    t = re.sub(r"\b(size|uk|eu|us|jp|it|fr)\b\s*[:\-]?\s*[0-9]{1,2}(?:\.[0-9]+)?(?:\s*[\-/]\s*[0-9]{1,2})?", " ", t, flags=re.I)
+    t = re.sub(r"\bsize\b\s*[:\-]?\s*(xxxl|xxl|xl|l|m|s|xs)\b", " ", t, flags=re.I)
+    # strip leftover non-word chars
+    t = re.sub(r"[^A-Za-z0-9\s\-']", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 
 # ─── Commands ───
 
@@ -514,12 +697,13 @@ async def cmd_scan(update, ctx):
         return
 
     profile = get_active_profile(update.effective_user.id)
-    size = parse_size(query)
+    sizes = parse_sizes(query)
+    size = sizes[0] if sizes else ""
     price = re.search(r'under\s*[£€$¥]?\s*(\d+)', query.lower())
 
     train_context = build_training_context(update.effective_user.id)
     msg = f"🔍 *Scanning for:* `{query}`\n"
-    if size: msg += f"📏 Size: *{size}*\n"
+    if sizes: msg += f"📏 Sizes: *{', '.join(sizes)}*\n"
     if price: msg += f"💰 Max: *£{price.group(1)}*\n"
     if profile: msg += f"👤 Profile: *{profile['name']}*\n"
     msg += "\n⏳ Getting AI analysis..."
@@ -536,7 +720,90 @@ async def cmd_scan(update, ctx):
         f"Give me: 1) Fair market value range in GBP 2) Best platforms or auctions to find this 3) What sizes to look for 4) Red flags to avoid 5) Best rep option if applicable. Be specific and practical.",
         "You are an archive fashion expert. Give concise, actionable intel."
     )
-    await safe_reply(update, f"⚡ Intel for: {query}\n\n{analysis}\n\nBot is scanning 24/7 — use /hunt to get alerted on matches.")
+
+    # If Claude is unavailable, fall back to stored intel
+    if analysis.startswith("AI unavailable") or not CLAUDE_OK:
+        intel_matches = find_intel(query)
+        if intel_matches:
+            analysis = "Stored intelligence:\n\n"
+            for it in intel_matches:
+                analysis += f"• {it['designer']} — {it['piece']} — {it.get('price_range','?')} · Platforms: {', '.join(it.get('platforms',[]))}\n  Notes: {it.get('notes','')}\n\n"
+        else:
+            analysis = "AI unavailable and no stored intel found — showing direct search links instead."
+
+    # Generate search links
+    links = generate_search_links(query)
+    links_text = "🔗 *Direct search links:*\n"
+    links_text += f"[Mercari JP]({links['mercari_jp']}) · "
+    links_text += f"[Yahoo Auctions]({links['yahoo_auctions']}) · "
+    links_text += f"[Xianyu]({links['xianyu']}) · "
+    links_text += f"[eBay]({links['ebay']}) · "
+    links_text += f"[Grailed]({links['grailed']}) · "
+    links_text += f"[Vinted]({links['vinted']})\n\n"
+
+    await safe_reply(update, f"⚡ Intel for: {query}\n\n{analysis}\n\n{links_text}Bot is scanning 24/7 — use /hunt to get alerted on matches.")
+
+
+async def cmd_search(update, ctx):
+    query = " ".join(ctx.args) if ctx.args else ""
+    if not query:
+        await safe_reply(update, "Usage: /search [brand] [piece] [size optional]. Example: /search ysl boots size 44")
+        return
+
+    normalized = normalize_search_query(query)
+    sizes = parse_sizes(query)
+
+    await safe_reply(update, f"🔎 Searching for: *{normalized}*{' · Sizes: ' + ', '.join(sizes) if sizes else ''}")
+
+    # quick AI summary (if available)
+    if CLAUDE_OK:
+        try:
+            summ = ask_claude(f"Quick search brief: '{normalized}' sizes: {', '.join(sizes)}. Provide top platforms and recommended exact search strings.", "You are a concise archive fashion search assistant.")
+        except Exception:
+            summ = ""
+    else:
+        summ = "AI unavailable — showing direct search links."
+
+    links = generate_search_links(normalized)
+    links_text = "🔗 Direct search links:\n"
+    links_text += f"[Mercari JP]({links['mercari_jp']}) · [Yahoo Auctions]({links['yahoo_auctions']}) · [Xianyu]({links['xianyu']}) · [eBay]({links['ebay']}) · [Grailed]({links['grailed']}) · [Vinted]({links['vinted']})\n\n"
+
+    # For convenience, include example size-appended link for first size
+    if sizes:
+        q2 = f"{normalized} {sizes[0]}"
+        l2 = generate_search_links(q2)
+        links_text += f"Example (with size): [Mercari JP]({l2['mercari_jp']}) · [eBay]({l2['ebay']})\n\n"
+
+    # Try concurrent async marketplace scraping for immediate live results
+    try:
+        results = await marketplaces.async_search_all_marketplaces(normalized)
+    except Exception:
+        results = []
+
+    results_text = ""
+    if results:
+        results_text = "🔎 Live listings:\n"
+        for r in results[:6]:
+            price = f" · {r.get('price')}" if r.get('price') else ""
+            results_text += f"• {r.get('platform')} — {r.get('title')}{price}\n  {r.get('url')}\n"
+        results_text += "\n"
+
+    await safe_reply(update, f"⚡ Search results for: {normalized}\n\n{summ}\n\n{links_text}{results_text}")
+
+
+async def cmd_match(update, ctx):
+    """Compute a perceptual hash for an image URL and return it for later visual matching."""
+    if not ctx.args:
+        await safe_reply(update, "Usage: /match [image_url] — computes a visual phash for image-based matching.")
+        return
+    url = ctx.args[0]
+    await safe_reply(update, "🔎 Computing visual hash...")
+    ph = vision.compute_phash(url)
+    if not ph:
+        await safe_reply(update, "Failed to fetch or process image. Ensure the URL is public and points to an image.")
+        return
+    await safe_reply(update, f"✅ Visual phash computed: {ph}\nSave this phash with /intel or include it in hunts to enable look-based matching later.")
+
 
 async def cmd_hunt(update, ctx):
     ctx.user_data["awaiting"] = "new_hunt"
@@ -559,7 +826,11 @@ async def cmd_hunts(update, ctx):
     text = "🎯 *Active hunts:*\n\n"
     for h in hunts:
         sizes = json.loads(h.get("sizes", "[]"))
-        text += f"→ *{h['name']}*\n  Max £{h.get('max_price', '?')} · {', '.join(sizes) if sizes else 'Any size'}\n\n"
+        query = f"{h.get('designer','')} {h.get('piece','')}"
+        links = generate_search_links(query)
+        text += f"→ *{h['name']}*\n"
+        text += f"  Max £{h.get('max_price', '?')} · {', '.join(sizes) if sizes else 'Any size'}\n"
+        text += f"  🔗 [Mercari]({links['mercari_jp']}) [Yahoo]({links['yahoo_auctions']}) [Xianyu]({links['xianyu']}) [eBay]({links['ebay']})\n\n"
     await safe_reply(update, text)
 
 async def cmd_deals(update, ctx):
@@ -592,18 +863,45 @@ async def cmd_sources(update, ctx):
     )
 
 async def cmd_intel(update, ctx):
-    await safe_reply(update, "🧠 Generating market intel...")
-    intel = ask_claude(
-        f"{build_training_context(update.effective_user.id)}Give me the latest archive fashion market intelligence:\n"
-        "1. Which platforms and auctions have the best deals right now and why\n"
-        "2. Top 3 most undervalued archive pieces to buy now\n"
-        "3. Best Weidian/Taobao rep sellers active right now with links or store names\n"
-        "4. Trending pieces or designers with rising prices\n"
-        "5. Specific tips for finding steals on Xianyu, Mercari JP, and Japanese auctions\n"
-        "Be very specific — names, prices, platforms, and auction markets.",
-        "You are an archive fashion market intelligence expert who monitors Reddit (r/QualityReps, r/DesignerReps, r/FashionReps), Grailed sold listings, Mercari JP, Xianyu, and Japanese auction markets."
-    )
-    await safe_reply(update, f"🧠 Market Intel\n\n{intel}")
+    if ctx.args:
+        # Store intel if arguments provided
+        # Usage: /intel Designer Piece £100-200 Mercari JP,Yahoo Auctions
+        ctx.user_data["awaiting"] = "new_intel"
+        await safe_reply(update,
+            "🧠 *Store piece intelligence*\n\n"
+            "Send details like this:\n\n"
+            "`Designer: Raf Simons\n"
+            "Piece: AW01 bomber\n"
+            "Price range: £200-400\n"
+            "Platforms: Mercari JP, Yahoo Auctions, Xianyu\n"
+            "Notes: Appears monthly on Mercari JP, rarely under £250`\n\n"
+            "This helps the bot give better intel on future hunts!"
+        )
+    else:
+        # Generate market intelligence
+        all_intel = get_all_intel()
+        intel_summary = ""
+        if all_intel:
+            intel_summary = "📊 *Stored piece intelligence:*\n\n"
+            for key, item in list(all_intel.items())[-5:]:
+                intel_summary += f"• *{item['designer']} — {item['piece']}*\n"
+                intel_summary += f"  Price: {item['price_range']} · Platforms: {', '.join(item['platforms'][:2])}\n\n"
+            intel_summary += "\n"
+        
+        await safe_reply(update, "🧠 Generating market intel...")
+        intel = ask_claude(
+            f"{build_training_context(update.effective_user.id)}Give me the latest archive fashion market intelligence:\n"
+            f"{intel_summary}"
+            "1. Which platforms and auctions have the best deals right now and why\n"
+            "2. Top 3 most undervalued archive pieces to buy now\n"
+            "3. Best Weidian/Taobao rep sellers active right now with links or store names\n"
+            "4. Trending pieces or designers with rising prices\n"
+            "5. Specific tips for finding steals on Xianyu, Mercari JP, and Japanese auctions\n"
+            "Be very specific — names, prices, platforms, and auction markets.",
+            "You are an archive fashion market intelligence expert who monitors Reddit (r/QualityReps, r/DesignerReps, r/FashionReps), Grailed sold listings, Mercari JP, Xianyu, and Japanese auction markets."
+        )
+        await safe_reply(update, f"🧠 Market Intel\n\n{intel}")
+
 
 async def cmd_sellers(update, ctx):
     await safe_reply(update, "🏪 Loading verified sellers...")
@@ -753,18 +1051,51 @@ async def handle_message(update, ctx):
                 if "designer" in k: hunt["designer"] = v
                 elif "piece" in k: hunt["piece"] = v
                 elif "price" in k: hunt["max_price"] = int(re.sub(r"[^\d]", "", v) or "0")
-                elif "size" in k: hunt["sizes"] = [s.strip() for s in v.split(",")]
+                elif "size" in k: hunt["sizes"] = [s.strip() for s in v.split(",") if s.strip()]
                 elif "season" in k: hunt["season"] = v
+
+            # Validate essential fields
+            if not hunt.get("designer") and not hunt.get("piece"):
+                ctx.user_data["awaiting"] = "new_hunt"
+                await safe_reply(update, "I couldn't find a `Designer` or `Piece` in your hunt. Please resend with at least one of those fields.")
+                return
+
             hunt["name"] = f"{hunt.get('designer','')} — {hunt.get('piece','')}".strip(" —") or "Unnamed hunt"
+            # sizes may be empty; allow but inform the user
+            if not hunt.get("sizes"):
+                hunt["sizes"] = []
+                size_note = "(No sizes provided — scanning all sizes)"
+            else:
+                size_note = f"Sizes: {', '.join(hunt.get('sizes'))}"
+
             save_hunt(update.effective_user.id, hunt)
+
+            # Also save intel for this piece if both designer and piece present
+            designer = hunt.get('designer', '')
+            piece = hunt.get('piece', '')
+            if designer and piece:
+                add_intel(
+                    designer,
+                    piece,
+                    f"£0-{hunt.get('max_price', 'Any')}",
+                    ["Mercari JP", "Yahoo Auctions", "Xianyu", "eBay", "Grailed"],
+                    f"Season: {hunt.get('season', 'Unknown')} · {size_note}"
+                )
+
             sizes = hunt.get("sizes", [])
+            links = generate_search_links(f"{hunt.get('designer','')} {hunt.get('piece','')}")
+            links_text = "🔗 [Mercari JP]({}) · [Yahoo Auctions]({}) · [Xianyu]({}) · [eBay]({})".format(
+                links['mercari_jp'], links['yahoo_auctions'], links['xianyu'], links['ebay']
+            )
             await safe_reply(update,
                 f"🎯 Hunt created: {hunt['name']}\n"
-                f"Max: £{hunt.get('max_price','Any')} · Sizes: {', '.join(sizes) if sizes else 'Any'}\n\n"
+                f"Max: £{hunt.get('max_price','Any')} · {', '.join(sizes) if sizes else 'Any size'}\n\n"
+                f"{links_text}\n\n"
                 f"Scanning 24/7. You'll be alerted on matches."
             )
         except Exception as e:
             await safe_reply(update, f"Couldn't parse. Try /hunt again.\nError: {str(e)[:100]}")
+
     elif awaiting == "new_memory":
         ctx.user_data["awaiting"] = None
         notes = [line.strip() for line in text.strip().split("\n") if line.strip()]
@@ -774,6 +1105,45 @@ async def handle_message(update, ctx):
             for note in notes:
                 add_user_memory(update.effective_user.id, note)
             await safe_reply(update, f"✅ Saved {len(notes)} archive memory item(s). Use /memory to review them.")
+    
+    elif awaiting == "new_intel":
+        ctx.user_data["awaiting"] = None
+        try:
+            intel_data = {}
+            platforms = []
+            for line in text.strip().split("\n"):
+                if ":" not in line: continue
+                k, v = line.split(":", 1)
+                k, v = k.strip().lower(), v.strip()
+                if "designer" in k: intel_data["designer"] = v
+                elif "piece" in k: intel_data["piece"] = v
+                elif "price" in k: intel_data["price_range"] = v
+                elif "platform" in k: platforms = [p.strip() for p in v.split(",")]
+                elif "note" in k: intel_data["notes"] = v
+            
+            if not intel_data.get("designer") or not intel_data.get("piece"):
+                await safe_reply(update, "Need at least Designer and Piece. Try /intel again.")
+                return
+            
+            add_intel(
+                intel_data["designer"],
+                intel_data["piece"],
+                intel_data.get("price_range", "Unknown"),
+                platforms or ["General"],
+                intel_data.get("notes", "")
+            )
+            
+            all_intel = get_all_intel()
+            await safe_reply(update,
+                f"✅ Intelligence stored!\n"
+                f"*{intel_data['designer']} — {intel_data['piece']}*\n"
+                f"Price: {intel_data.get('price_range', 'Unknown')}\n"
+                f"Platforms: {', '.join(platforms) if platforms else 'General'}\n\n"
+                f"Total intel stored: {len(all_intel)} pieces"
+            )
+        except Exception as e:
+            await safe_reply(update, f"Couldn't parse intel. Try /intel again.\nError: {str(e)[:100]}")
+    
     else:
         profile = get_active_profile(update.effective_user.id)
         pi = f"Active profile: {profile['name']}" if profile else ""
@@ -785,30 +1155,103 @@ async def handle_message(update, ctx):
 
 # ─── Background scanner ───
 
+async def _send_hunt_alert(app, chat_id, text):
+    """Send an alert with RetryAfter handling."""
+    from telegram.error import RetryAfter
+    for attempt in range(4):
+        try:
+            await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+            return True
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except Exception as e:
+            log.error(f"Alert send error: {e}")
+            return False
+    return False
+
+
 async def background_scanner(app):
     log.info("Background scanner started")
     await asyncio.sleep(30)
+    # Track last alert time per hunt to avoid flooding — 30 min minimum between same-hunt alerts
+    last_alerted = {}
+
     while True:
         try:
             hunts = supa_get("hunts", {"active": "eq.true"})
             log.info(f"Scanner: {len(hunts)} active hunts")
+            now = asyncio.get_event_loop().time()
+
             for hunt in hunts:
                 try:
+                    hunt_id = hunt.get("id")
+                    if hunt_id and last_alerted.get(hunt_id, 0) > now - 1800:
+                        continue  # throttle: 30 min between alerts per hunt
+
                     query = f"{hunt.get('designer','')} {hunt.get('piece','')}".strip()
-                    if not query: continue
-                    alert = ask_claude(
-                        f"{build_training_context(hunt['telegram_id'])}Quick scan for: {query}\nMax price: £{hunt.get('max_price','any')}\n"
-                        f"Give 1 actionable tip for finding this piece right now on Yahoo Auctions, eBay auctions, Mercari JP, Xianyu, Grailed, Vinted or Taobao. "
-                        f"If auction listings are available, call them out explicitly.",
-                        "You are an archive fashion deal finder. Be brief and specific."
+                    if not query:
+                        continue
+
+                    links = generate_search_links(query)
+                    links_text = (
+                        f"\n\n🔗 [Mercari JP]({links['mercari_jp']}) · "
+                        f"[Yahoo Auctions]({links['yahoo_auctions']}) · "
+                        f"[Xianyu]({links['xianyu']}) · "
+                        f"[eBay]({links['ebay']})"
                     )
-                    if any(w in alert.lower() for w in ["check","found","available","listed","search","try"]):
-                        try:
-                            await app.bot.send_message(chat_id=hunt["telegram_id"], text=f"🔥 Hunt update: {hunt['name']}\n\n{alert}")
-                        except Exception as e:
-                            log.error(f"Alert send error: {e}")
+
+                    # Try live scraping first (concurrent across all platforms)
+                    live_results = []
+                    try:
+                        live_results = await marketplaces.async_search_all_marketplaces(query)
+                    except Exception as e:
+                        log.warning(f"Live scrape failed for {query}: {e}")
+
+                    alerted = False
+                    if live_results:
+                        lines = [f"🔥 Live listings: *{hunt['name']}*"]
+                        for r in live_results[:5]:
+                            price_str = f" · {r['price']}" if r.get("price") else ""
+                            lines.append(f"• [{r['platform']}] {r['title']}{price_str}\n  {r['url']}")
+                        body = "\n\n".join(lines) + links_text
+                        await asyncio.sleep(0.5)  # respect Telegram 1 msg/sec per chat
+                        alerted = await _send_hunt_alert(app, hunt["telegram_id"], body)
+
+                    if not alerted and CLAUDE_OK:
+                        alert = ask_claude(
+                            f"{build_training_context(hunt['telegram_id'])}Quick scan for: {query}\n"
+                            f"Max price: £{hunt.get('max_price','any')}\n"
+                            "Give 1 specific, actionable tip for finding this piece right now. Be brief.",
+                            "You are an archive fashion deal finder.",
+                        )
+                        if any(w in alert.lower() for w in ["check", "found", "available", "listed", "search", "try", "look"]):
+                            await asyncio.sleep(0.5)
+                            alerted = await _send_hunt_alert(
+                                app, hunt["telegram_id"],
+                                f"🔥 Hunt update: *{hunt['name']}*\n\n{alert}{links_text}"
+                            )
+
+                    if not alerted:
+                        # Intel fallback
+                        intel_matches = find_intel(query)
+                        if intel_matches:
+                            lines = [f"🔥 Hunt intel: *{hunt['name']}*"]
+                            for it in intel_matches:
+                                lines.append(
+                                    f"• *{it['designer']} — {it['piece']}*\n"
+                                    f"  {it.get('price_range','?')} · {', '.join(it.get('platforms',[]))}\n"
+                                    f"  {it.get('notes','')}"
+                                )
+                            body = "\n\n".join(lines) + links_text
+                            await asyncio.sleep(0.5)
+                            alerted = await _send_hunt_alert(app, hunt["telegram_id"], body)
+
+                    if alerted and hunt_id:
+                        last_alerted[hunt_id] = now
+
                 except Exception as e:
                     log.error(f"Hunt error: {e}")
+
             await asyncio.sleep(300)
         except Exception as e:
             log.error(f"Scanner error: {e}")
@@ -818,10 +1261,36 @@ async def background_scanner(app):
 
 async def post_init(app):
     asyncio.create_task(background_scanner(app))
+    # Start continuous deals scanner if available
+    if 'deals_scanner' in globals() and callable(globals()['deals_scanner']):
+        asyncio.create_task(globals()['deals_scanner'](app))
+    else:
+        log.warning("deals_scanner not defined; skipping deals scanner startup")
     log.info("Archive Hunter fully started")
 
 def main():
     log.info("Archive Hunter starting...")
+    # PID lock to avoid multiple polling instances causing Telegram 409 Conflict
+    PID_FILE = os.path.join(os.path.dirname(__file__), 'bot.pid')
+    force = os.environ.get('FORCE_START', '').lower() in ('1', 'true', 'yes')
+    if os.path.isfile(PID_FILE):
+        try:
+            with open(PID_FILE, 'r') as f:
+                existing = int(f.read().strip())
+            if psutil.pid_exists(existing):
+                log.warning(f"Another bot process detected (PID {existing}). Use FORCE_START=1 to override or stop the other process.")
+                if not force:
+                    raise SystemExit("Aborting start due to existing bot process. Set FORCE_START=1 to override.")
+                else:
+                    log.warning("FORCE_START set — continuing despite existing process.")
+        except Exception:
+            log.warning("Could not read existing PID file; continuing.")
+    try:
+        with open(PID_FILE, 'w') as f:
+            f.write(str(os.getpid()))
+    except Exception:
+        log.warning("Could not write PID file; continuing.")
+
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
@@ -831,7 +1300,8 @@ def main():
     app.add_handler(CommandHandler("profile", cmd_profile))
     app.add_handler(CommandHandler("measurements", cmd_newprofile))
     app.add_handler(CommandHandler("scan", cmd_scan))
-    app.add_handler(CommandHandler("search", cmd_scan))
+    app.add_handler(CommandHandler("search", cmd_search))
+    app.add_handler(CommandHandler("match", cmd_match))
     app.add_handler(CommandHandler("find", cmd_scan))
     app.add_handler(CommandHandler("auction", cmd_scan))
     app.add_handler(CommandHandler("remember", cmd_remember))
